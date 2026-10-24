@@ -1,9 +1,9 @@
 """
-Precios de juegos en pesos argentinos — versión 1 (Steam + Epic)
+Precios de juegos en pesos argentinos — versión 2 (Steam + Epic + Game Pass)
 
 Qué hace:
   1. Busca el dólar oficial del día.
-  2. Trae las ofertas de Steam (tienda Argentina) y los juegos gratis de Epic.
+  2. Trae las ofertas de Steam, los juegos gratis de Epic y el catálogo de Game Pass.
   3. Calcula el precio final en pesos (dólar oficial + IVA + Ingresos Brutos).
   4. Genera "index.html", una página con buscador lista para publicar.
 
@@ -17,6 +17,7 @@ No necesita instalar nada: usa solo librerías que ya vienen con Python.
 import datetime
 import html
 import json
+import re
 import sys
 import urllib.request
 
@@ -54,8 +55,51 @@ def a_pesos(usd, dolar):
 # ---------------------------------------------------------------------------
 # Tiendas
 # ---------------------------------------------------------------------------
+PAGINAS_STEAM = 5   # cada página trae hasta 100 ofertas
+
+
 def ofertas_steam(dolar):
-    """Juegos en oferta en la tienda de Steam para Argentina."""
+    """Todas las ofertas del buscador de Steam (Argentina), hasta 500 juegos."""
+    juegos, vistos = [], set()
+    for pagina in range(PAGINAS_STEAM):
+        data = get_json(
+            "https://store.steampowered.com/search/results/?query&specials=1"
+            f"&cc=ar&l=spanish&infinite=1&count=100&start={pagina * 100}"
+        )
+        filas = re.findall(
+            r'<a [^>]*data-ds-appid="(\d+)"[^>]*>(.*?)</a>',
+            data.get("results_html", ""), re.S,
+        )
+        if not filas:
+            break
+        for appid, cuerpo in filas:
+            titulo = re.search(r'<span class="title">(.*?)</span>', cuerpo, re.S)
+            final = re.search(r'data-price-final="(\d+)"', cuerpo)
+            desc = re.search(r'data-discount="(\d+)"', cuerpo)
+            if appid in vistos or not (titulo and final and desc):
+                continue
+            descuento = int(desc.group(1))
+            if descuento <= 0:
+                continue
+            vistos.add(appid)
+            usd_final = int(final.group(1)) / 100
+            usd_original = usd_final / (1 - descuento / 100) if descuento < 100 else 0
+            juegos.append({
+                "tienda": "Steam",
+                "nombre": html.unescape(titulo.group(1).strip()),
+                "imagen": f"https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg",
+                "url": f"https://store.steampowered.com/app/{appid}",
+                "descuento": descuento,
+                "usd": usd_final,
+                "ars": a_pesos(usd_final, dolar),
+                "ars_original": a_pesos(usd_original, dolar),
+            })
+    # Si el buscador cambia de formato, usamos la lista corta de destacados
+    return juegos or ofertas_steam_destacadas(dolar)
+
+
+def ofertas_steam_destacadas(dolar):
+    """Plan B: las ofertas destacadas de Steam (unas pocas)."""
     data = get_json(
         "https://store.steampowered.com/api/featuredcategories?cc=ar&l=spanish"
     )
@@ -131,6 +175,64 @@ def gratis_epic():
     return juegos
 
 
+GAMEPASS_LISTAS = {
+    "Consola": "f6f1f99f-9b49-4ccd-b3bf-4d9767a77f5e",
+    "PC": "fdd9e2a7-0fee-49f6-ad69-4354098401ff",
+}
+
+
+def juegos_gamepass():
+    """Catálogo de Game Pass (consola y PC) para Argentina."""
+    plataformas = {}   # id del juego -> {"Consola", "PC"}
+    for plataforma, lista in GAMEPASS_LISTAS.items():
+        try:
+            data = get_json(
+                f"https://catalog.gamepass.com/sigls/v2?id={lista}"
+                "&language=es-ar&market=AR"
+            )
+        except Exception as error:
+            print(f"Game Pass {plataforma}: no se pudo leer ({error})")
+            continue
+        for item in data:
+            if "id" in item:
+                plataformas.setdefault(item["id"], set()).add(plataforma)
+        print(f"Game Pass {plataforma}: {sum(1 for i in data if 'id' in i)} juegos")
+
+    ids = list(plataformas)
+    juegos = []
+    for i in range(0, len(ids), 20):   # Microsoft acepta de a 20 por consulta
+        data = get_json(
+            "https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds="
+            + ",".join(ids[i:i + 20]) + "&market=AR&languages=es-ar"
+        )
+        for prod in data.get("Products", []):
+            pid = prod.get("ProductId", "")
+            props = (prod.get("LocalizedProperties") or [{}])[0]
+            nombre = props.get("ProductTitle")
+            if not nombre:
+                continue
+            imagen = ""
+            for tipo in ("SuperHeroArt", "BoxArt", "Poster"):
+                for img in props.get("Images", []):
+                    if img.get("ImagePurpose") == tipo:
+                        imagen = "https:" + img["Uri"] if img["Uri"].startswith("//") else img["Uri"]
+                        break
+                if imagen:
+                    break
+            juegos.append({
+                "tienda": "Game Pass",
+                "nombre": nombre,
+                "imagen": imagen,
+                "url": f"https://www.xbox.com/es-AR/games/store/x/{pid}",
+                "descuento": 0,
+                "usd": 0,
+                "ars": 0,
+                "ars_original": 0,
+                "plataforma": " y ".join(sorted(plataformas.get(pid, []))),
+            })
+    return juegos
+
+
 def datos_demo():
     """Datos inventados para probar la página sin conexión."""
     dolar = 1500.0
@@ -148,6 +250,11 @@ def datos_demo():
         "tienda": "Epic", "nombre": "Juego gratis de ejemplo", "imagen": "",
         "url": "#", "descuento": 100, "usd": 0, "ars": 0, "ars_original": 0,
         "hasta": "2026-10-31",
+    })
+    juegos.append({
+        "tienda": "Game Pass", "nombre": "Juego de Game Pass de ejemplo",
+        "imagen": "", "url": "#", "descuento": 0, "usd": 0, "ars": 0,
+        "ars_original": 0, "plataforma": "Consola y PC",
     })
     return dolar, juegos
 
@@ -184,6 +291,7 @@ PLANTILLA = """<!doctype html>
   .tienda { font-size:.75rem; color:var(--sub); text-transform:uppercase; letter-spacing:.04em; }
   .desc { background:var(--verde); color:#fff; font-weight:700; font-size:.8rem; padding:2px 6px; border-radius:6px; }
   .precio { font-weight:700; font-size:1.1rem; }
+  .gp { background:#107c10; }
   .tachado { text-decoration:line-through; color:var(--sub); font-size:.85rem; }
   footer { text-align:center; color:var(--sub); font-size:.8rem; padding:0 16px 30px; }
 </style>
@@ -199,6 +307,7 @@ PLANTILLA = """<!doctype html>
     <option value="">Todas las tiendas</option>
     <option>Steam</option>
     <option>Epic</option>
+    <option>Game Pass</option>
   </select>
   <select id="orden">
     <option value="desc">Mayor descuento</option>
@@ -223,11 +332,12 @@ PLANTILLA = """<!doctype html>
       <a class="card" href="${esc(j.url)}" target="_blank" rel="noopener">
         ${j.imagen ? `<img src="${esc(j.imagen)}" alt="" loading="lazy">` : `<div class="sinimg"></div>`}
         <div class="cuerpo">
-          <span class="tienda">${j.tienda}${j.hasta ? " · gratis hasta " + j.hasta : ""}</span>
+          <span class="tienda">${j.tienda}${j.hasta ? " · gratis hasta " + j.hasta : ""}${j.plataforma ? " · " + j.plataforma : ""}</span>
           <span class="nombre">${esc(j.nombre)}</span>
           <div class="fila">
+            ${j.tienda === "Game Pass" ? `<span class="desc gp">Game Pass</span><span class="precio">Incluido</span>` : `
             <span class="desc">-${j.descuento}%</span>
-            <span class="precio">${j.ars === 0 ? "GRATIS" : pesos(j.ars)}</span>
+            <span class="precio">${j.ars === 0 ? "GRATIS" : pesos(j.ars)}</span>`}
             ${j.ars_original > j.ars ? `<span class="tachado">${pesos(j.ars_original)}</span>` : ""}
           </div>
         </div>
@@ -268,7 +378,8 @@ def main():
         juegos = []
         # Si una tienda falla, seguimos con las otras
         for nombre, funcion in [("Steam", lambda: ofertas_steam(dolar)),
-                                ("Epic", gratis_epic)]:
+                                ("Epic", gratis_epic),
+                                ("Game Pass", juegos_gamepass)]:
             try:
                 encontrados = funcion()
                 print(f"{nombre}: {len(encontrados)} juegos")
